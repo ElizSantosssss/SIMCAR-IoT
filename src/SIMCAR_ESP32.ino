@@ -1,4 +1,4 @@
-/ Bibliotecas necessárias
+// Bibliotecas necessárias
 #include <WiFi.h>
 #include <PubSubClient.h>      // Para MQTT
 #include <Wire.h>              // Para I2C (LCD)
@@ -11,7 +11,7 @@ volatile long contadorPulsosFluxo = 0;
 volatile float fluxoAgua = 0.0; // L/min ou L - Tornar volátil pois é modificada na ISR
 volatile bool mudancaFluxo = false; // Flag para indicar mudança no fluxo
 
-// Pino para o Potenciômetro (Sensor de pH)
+// Pino para o Potenciômetro (Sensor de PH)
 #define PINO_ADC_PH 35
 float valorPH = 7.0;
 
@@ -28,7 +28,9 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 float turbidez = 20; // NTU - Simulado ou com outro potenciômetro
 unsigned long tempoInicioVazamento = 0;
 const int TEMPO_MAX_VAZAMENTO_SEGUNDOS = 120; // Pode ser reduzido para teste rápido (ex: 10 ou 20)
-const float FLUXO_LIMITE_VAZAMENTO = 1.0; // Reduzido para teste rápido com encoder
+const float FLUXO_LIMITE_VAZAMENTO = 10.0; // Reduzido para teste rápido com encoder
+unsigned long tempoFechamentoVazamento = 0;
+const unsigned long TEMPO_REABERTURA = 60000; 
 
 // Variáveis para o Rotary Encoder
 volatile int clkAnteriorISR; // Usar volatile para variáveis de ISR
@@ -49,17 +51,45 @@ const char* topic_turbidez = "simcar/residencia01/turbidez"; // Adicionado para 
 const char* topic_alerta_vazamento = "simcar/residencia01/alerta/vazamento";
 const char* topic_status_valvula = "simcar/residencia01/status/valvula";
 const char* topic_status_bomba = "simcar/residencia01/status/bomba";
-// const char* topic_comando_valvula = "simcar/residencia01/comando/valvula"; // Exemplo se for receber comandos
 
 WiFiClient espClient;
 PubSubClient client(espClient); // Cliente MQTT
 
 unsigned long ultimaPublicacaoMQTT = 0;
 const long intervaloPublicacaoMQTT = 5000; // Publica a cada 5 segundos
+unsigned long ultimaAtualizacaoLCD = 0;
+const long intervaloAtualizacaoLCD = 1000; // Atualiza LCD a cada 1 segundo
 
-// --- Interação com Sensores no Wokwi ---
-// Rotary Encoder (Fluxo): Clique no corpo do encoder e arraste o mouse para cima/baixo para girá-lo.
-// Potenciômetro (pH): Clique no cursor (parte móvel) do potenciômetro e arraste-o para alterar a resistência/valor.
+// Variáveis para medição de tempo
+unsigned long tempoInicioSensorFluxo = 0;
+unsigned long tempoFimSensorFluxo = 0;
+unsigned long tempoInicioSensorPH = 0;
+unsigned long tempoFimSensorPH = 0;
+unsigned long tempoInicioAtuadorValvula = 0;
+unsigned long tempoFimAtuadorValvula = 0;
+unsigned long tempoInicioAtuadorBomba = 0;
+unsigned long tempoFimAtuadorBomba = 0;
+
+// Arrays para armazenar as medições
+unsigned long medicoesTempoSensorFluxo[4] = {0, 0, 0, 0};
+unsigned long medicoesTempoSensorPH[4] = {0, 0, 0, 0};
+unsigned long medicoesTempoAtuadorValvula[4] = {0, 0, 0, 0};
+unsigned long medicoesTempoAtuadorBomba[4] = {0, 0, 0, 0};
+
+// Contadores para as medições
+int contadorMedicaoFluxo = 0;
+int contadorMedicaoPH = 0;
+int contadorMedicaoValvula = 0;
+int contadorMedicaoBomba = 0;
+
+// Função para calcular a média
+unsigned long calcularMedia(unsigned long medicoes[4]) {
+  unsigned long soma = 0;
+  for (int i = 0; i < 4; i++) {
+    soma += medicoes[i];
+  }
+  return soma / 4;
+}
 
 void IRAM_ATTR isrEncoder() {
   int clkAtual = digitalRead(PINO_ENCODER_CLK);
@@ -110,7 +140,6 @@ void setup_wifi() {
     lcd.clear();
     lcd.setCursor(0,0);
     lcd.print("Falha WiFi");
-    // Prosseguir mesmo sem WiFi para testes locais, mas MQTT não funcionará
   }
 }
 
@@ -123,22 +152,14 @@ void callback_mqtt(char* topic, byte* payload, unsigned int length) {
     mensagemPayload += (char)payload[i];
   }
   Serial.println(mensagemPayload);
+  
+  // Mostra a mensagem no LCD temporariamente
   lcd.clear();
   lcd.setCursor(0,0);
   lcd.print("MQTT Msg Rx:");
   lcd.setCursor(0,1);
-  lcd.print(mensagemPayload.substring(0,15)); // Mostra parte da msg no LCD
-
-  // Exemplo: Lógica para tratar comandos recebidos
-  // if (String(topic) == topic_comando_valvula) {
-  //   if (mensagemPayload == "FECHAR") {
-  //     digitalWrite(PINO_VALVULA, HIGH);
-  //     client.publish(topic_status_valvula, "FECHADA");
-  //   } else if (mensagemPayload == "ABRIR") {
-  //     digitalWrite(PINO_VALVULA, LOW);
-  //     client.publish(topic_status_valvula, "ABERTA");
-  //   }
-  // }
+  lcd.print(mensagemPayload.substring(0,15));
+  delay(2000); // Mostra por 2 segundos
 }
 
 void reconnect_mqtt() {
@@ -154,11 +175,6 @@ void reconnect_mqtt() {
       lcd.setCursor(0,0);
       lcd.print("MQTT Conectado!");
       delay(1000);
-      // Publica uma mensagem de status (opcional)
-      // client.publish("simcar/residencia01/status/sistema", "ESP32 Online");
-      // Se for receber comandos, se inscreva aqui:
-      // client.subscribe(topic_comando_valvula);
-      // Serial.print("Inscrito no tópico: "); Serial.println(topic_comando_valvula);
     } else {
       Serial.print("falhou, rc=");
       Serial.print(client.state());
@@ -168,6 +184,74 @@ void reconnect_mqtt() {
       delay(5000);
     }
   }
+}
+
+void exibirResultadosMedicoes() {
+  if (contadorMedicaoFluxo >= 4 && contadorMedicaoPH >= 4 && 
+      contadorMedicaoValvula >= 4 && contadorMedicaoBomba >= 4) {
+    
+    Serial.println("\n----- RESULTADOS DAS MEDIÇÕES DE TEMPO -----");
+    
+    Serial.println("\nSensor de Fluxo:");
+    for (int i = 0; i < 4; i++) {
+      Serial.print("Medição #");
+      Serial.print(i+1);
+      Serial.print(": ");
+      Serial.print(medicoesTempoSensorFluxo[i]);
+      Serial.println(" ms");
+    }
+    Serial.print("Média: ");
+    Serial.print(calcularMedia(medicoesTempoSensorFluxo));
+    Serial.println(" ms");
+    
+    Serial.println("\nSensor de pH:");
+    for (int i = 0; i < 4; i++) {
+      Serial.print("Medição #");
+      Serial.print(i+1);
+      Serial.print(": ");
+      Serial.print(medicoesTempoSensorPH[i]);
+      Serial.println(" ms");
+    }
+    Serial.print("Média: ");
+    Serial.print(calcularMedia(medicoesTempoSensorPH));
+    Serial.println(" ms");
+    
+    Serial.println("\nAtuador Válvula:");
+    for (int i = 0; i < 4; i++) {
+      Serial.print("Medição #");
+      Serial.print(i+1);
+      Serial.print(": ");
+      Serial.print(medicoesTempoAtuadorValvula[i]);
+      Serial.println(" ms");
+    }
+    Serial.print("Média: ");
+    Serial.print(calcularMedia(medicoesTempoAtuadorValvula));
+    Serial.println(" ms");
+    
+    Serial.println("\nAtuador Bomba:");
+    for (int i = 0; i < 4; i++) {
+      Serial.print("Medição #");
+      Serial.print(i+1);
+      Serial.print(": ");
+      Serial.print(medicoesTempoAtuadorBomba[i]);
+      Serial.println(" ms");
+    }
+    Serial.print("Média: ");
+    Serial.print(calcularMedia(medicoesTempoAtuadorBomba));
+    Serial.println(" ms");
+    
+    Serial.println("\n-----------------------------------------");
+  }
+}
+
+void atualizarLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Fluxo: "); lcd.print(fluxoAgua, 1); lcd.print("L/m");
+  lcd.setCursor(0, 1);
+  lcd.print("pH: "); lcd.print(valorPH, 1);
+  if(digitalRead(PINO_VALVULA) == HIGH) { lcd.print(" V:F"); }
+  if(digitalRead(PINO_BOMBA) == HIGH) { lcd.print(" B:ON"); }
 }
 
 void setup() {
@@ -185,7 +269,7 @@ void setup() {
 
   // Configura o servidor e porta MQTT
   client.setServer(mqtt_server, mqtt_port);
-  // client.setCallback(callback_mqtt); // Descomente se for receber mensagens MQTT
+  client.setCallback(callback_mqtt);
 
   // Configura pinos dos sensores
   pinMode(PINO_ENCODER_CLK, INPUT_PULLUP);
@@ -210,61 +294,93 @@ void loop() {
     if (!client.connected()) {
       reconnect_mqtt();
     }
-    client.loop(); // Essencial para o cliente MQTT
+    client.loop();
   }
 
   // 1. Leitura dos Sensores
   if (mudancaFluxo) {
+    tempoInicioSensorFluxo = millis();
     Serial.print("[DEBUG Fluxo] Pulsos: "); Serial.print(contadorPulsosFluxo);
     Serial.print(", Fluxo: "); Serial.println(fluxoAgua);
     mudancaFluxo = false;
   }
 
+  tempoInicioSensorPH = millis();
   int leituraADC_PH = analogRead(PINO_ADC_PH);
   valorPH = map(leituraADC_PH, 0, 4095, 0, 140) / 10.0;
-  Serial.print("[DEBUG pH] ADC: "); Serial.print(leituraADC_PH);
-  Serial.print(", pH: "); Serial.println(valorPH);
-
-  // 2. Lógica de Controle
-  bool vazamentoDetectadoEsteLoop = false;
-  if (fluxoAgua > FLUXO_LIMITE_VAZAMENTO) {
-    if (tempoInicioVazamento == 0) {
-      tempoInicioVazamento = millis();
-      Serial.println("[DEBUG Válvula] Início contagem vazamento.");
-    }
-    unsigned long tempoDecorridoSegundos = (millis() - tempoInicioVazamento) / 1000;
-    Serial.print("[DEBUG Válvula] Tempo decorrido fluxo alto: "); Serial.print(tempoDecorridoSegundos); Serial.println("s");
-
-    if (tempoDecorridoSegundos > TEMPO_MAX_VAZAMENTO_SEGUNDOS) {
-      Serial.println("!!! ALERTA DE VAZAMENTO - FECHANDO VÁLVULA (LED) !!!");
-      digitalWrite(PINO_VALVULA, HIGH); // Fecha válvula (LED acende)
-      vazamentoDetectadoEsteLoop = true;
-    }
-  } else {
-    if (tempoInicioVazamento != 0) {
-        Serial.println("[DEBUG Válvula] Fluxo normalizado, resetando tempo.");
-        // Manter válvula fechada se já fechou por vazamento, ou aberta se não.
-        // Para reabrir automaticamente, descomente: digitalWrite(PINO_VALVULA, LOW);
-    }
-    tempoInicioVazamento = 0;
+  tempoFimSensorPH = millis();
+  
+  if (contadorMedicaoPH < 4) {
+    medicoesTempoSensorPH[contadorMedicaoPH] = tempoFimSensorPH - tempoInicioSensorPH;
+    contadorMedicaoPH++;
+    Serial.print("Medição de tempo Sensor pH #");
+    Serial.print(contadorMedicaoPH);
+    Serial.print(": ");
+    Serial.print(medicoesTempoSensorPH[contadorMedicaoPH-1]);
+    Serial.println(" ms");
   }
 
+  // 2. Lógica de Controle - Vazamento 
+bool vazamentoDetectadoEsteLoop = false;
+if (fluxoAgua > FLUXO_LIMITE_VAZAMENTO) {
+  if (tempoInicioVazamento == 0) {
+    tempoInicioVazamento = millis();
+    Serial.println("[DEBUG Válvula] Início contagem vazamento.");
+  }
+  
+  unsigned long tempoDecorridoSegundos = (millis() - tempoInicioVazamento) / 1000;
+  Serial.print("[DEBUG Válvula] Tempo decorrido fluxo alto: "); 
+  Serial.print(tempoDecorridoSegundos); 
+  Serial.println("s");
+
+  if (tempoDecorridoSegundos > TEMPO_MAX_VAZAMENTO_SEGUNDOS && digitalRead(PINO_VALVULA) == LOW) {
+    Serial.println("!!! ALERTA DE VAZAMENTO - FECHANDO VÁLVULA !!!");
+    digitalWrite(PINO_VALVULA, HIGH); // Fecha válvula
+    tempoFechamentoVazamento = millis(); // Registra quando fechou
+    vazamentoDetectadoEsteLoop = true;
+    
+    if (WiFi.status() == WL_CONNECTED && client.connected()) {
+      client.publish(topic_status_valvula, "FECHADA");
+      client.publish(topic_alerta_vazamento, "VAZAMENTO_DETECTADO");
+    }
+  }
+} 
+else {
+  // Se a válvula está fechada por vazamento E já passou 1 minuto OU o fluxo normalizou
+  if (digitalRead(PINO_VALVULA) == HIGH && 
+      (millis() - tempoFechamentoVazamento > TEMPO_REABERTURA || fluxoAgua <= FLUXO_LIMITE_VAZAMENTO)) {
+    
+    Serial.println("[DEBUG] Reabrindo válvula após normalização do fluxo");
+    digitalWrite(PINO_VALVULA, LOW); // Reabre válvula
+    
+    if (WiFi.status() == WL_CONNECTED && client.connected()) {
+      client.publish(topic_status_valvula, "ABERTA");
+    }
+  }
+  tempoInicioVazamento = 0; // Reseta o contador de vazamento
+}
+
+  // Controle da Bomba
   bool condicaoBomba = (turbidez < 50 && valorPH >= 6.5 && valorPH <= 7.5);
-  if (condicaoBomba) {
-    Serial.println("ATIVA BOMBA/BUZZER");
-    digitalWrite(PINO_BOMBA, HIGH);
-  } else {
-    digitalWrite(PINO_BOMBA, LOW);
+  tempoInicioAtuadorBomba = millis();
+  digitalWrite(PINO_BOMBA, condicaoBomba ? HIGH : LOW);
+  tempoFimAtuadorBomba = millis();
+  
+  if (contadorMedicaoBomba < 4) {
+    medicoesTempoAtuadorBomba[contadorMedicaoBomba] = tempoFimAtuadorBomba - tempoInicioAtuadorBomba;
+    contadorMedicaoBomba++;
+    Serial.print("Medição de tempo Atuador Bomba #");
+    Serial.print(contadorMedicaoBomba);
+    Serial.print(": ");
+    Serial.print(medicoesTempoAtuadorBomba[contadorMedicaoBomba-1]);
+    Serial.println(" ms");
   }
 
-  // 3. Atualização do Display LCD
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Fluxo: "); lcd.print(fluxoAgua, 1); lcd.print("L/m");
-  lcd.setCursor(0, 1);
-  lcd.print("pH: "); lcd.print(valorPH, 1);
-  if(digitalRead(PINO_VALVULA) == HIGH) { lcd.print(" V:F");}
-  if(digitalRead(PINO_BOMBA) == HIGH) { lcd.print(" B:ON");}
+  // Atualização do LCD em intervalos regulares
+  if (millis() - ultimaAtualizacaoLCD > intervaloAtualizacaoLCD) {
+    ultimaAtualizacaoLCD = millis();
+    atualizarLCD();
+  }
 
   // 4. Publicação MQTT
   unsigned long agora = millis();
@@ -272,35 +388,38 @@ void loop() {
     ultimaPublicacaoMQTT = agora;
     Serial.println("-- Publicando dados MQTT --");
 
+    tempoInicioSensorFluxo = millis();
     char msg_payload[64];
     snprintf(msg_payload, sizeof(msg_payload), "{\"valor\":%.2f, \"unidade\":\"L/min\"}", fluxoAgua);
     client.publish(topic_fluxo, msg_payload);
+    tempoFimSensorFluxo = millis();
+    
+    if (contadorMedicaoFluxo < 4) {
+      medicoesTempoSensorFluxo[contadorMedicaoFluxo] = tempoFimSensorFluxo - tempoInicioSensorFluxo;
+      contadorMedicaoFluxo++;
+      Serial.print("Medição de tempo Sensor Fluxo #");
+      Serial.print(contadorMedicaoFluxo);
+      Serial.print(": ");
+      Serial.print(medicoesTempoSensorFluxo[contadorMedicaoFluxo-1]);
+      Serial.println(" ms");
+    }
+
     Serial.print("Publicado [Fluxo]: "); Serial.println(msg_payload);
 
     snprintf(msg_payload, sizeof(msg_payload), "{\"valor\":%.2f}", valorPH);
     client.publish(topic_ph, msg_payload);
     Serial.print("Publicado [pH]: "); Serial.println(msg_payload);
     
-    snprintf(msg_payload, sizeof(msg_payload), "{\"valor\":%.2f, \"unidade\":\"NTU\"}", turbidez); // Publica turbidez fixa
+    snprintf(msg_payload, sizeof(msg_payload), "{\"valor\":%.2f, \"unidade\":\"NTU\"}", turbidez);
     client.publish(topic_turbidez, msg_payload);
     Serial.print("Publicado [Turbidez]: "); Serial.println(msg_payload);
 
     client.publish(topic_status_valvula, digitalRead(PINO_VALVULA) == HIGH ? "FECHADA" : "ABERTA");
     client.publish(topic_status_bomba, digitalRead(PINO_BOMBA) == HIGH ? "LIGADA" : "DESLIGADA");
-
-    if (vazamentoDetectadoEsteLoop) {
-        client.publish(topic_alerta_vazamento, "VAZAMENTO_DETECTADO");
-        Serial.println("Publicado [Alerta Vazamento]");
-    }
   }
 
-  Serial.println("--- STATUS ATUAL ---");
-  Serial.print("Valvula (LED pino "); Serial.print(PINO_VALVULA); Serial.print("): ");
-  Serial.println(digitalRead(PINO_VALVULA) == HIGH ? "FECHADA (LED ACESO)" : "ABERTA (LED APAGADO)");
-  Serial.print("Bomba (Buzzer pino "); Serial.print(PINO_BOMBA); Serial.print("): ");
-  Serial.println(digitalRead(PINO_BOMBA) == HIGH ? "LIGADA (BUZZER SOANDO)" : "DESLIGADA (BUZZER QUIETO)");
-  Serial.println("----------------------");
+  // Exibir resultados quando todas as medições estiverem completas
+  exibirResultadosMedicoes();
 
-  delay(1000); // Reduzido para publicações MQTT mais frequentes se necessário, mas loop principal mais rápido
+  delay(100);
 }
-
